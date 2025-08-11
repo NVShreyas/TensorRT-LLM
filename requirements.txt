@@ -51,7 +51,7 @@ setuptools<80
 ordered-set
 peft
 einops
-flashinfer-python==0.2.5
+flashinfer-python==0.2.8
 opencv-python-headless
 xgrammar==0.1.21
 llguidance==0.7.29
