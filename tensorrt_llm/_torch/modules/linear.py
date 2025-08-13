@@ -25,6 +25,7 @@ from ..._utils import get_sm_version
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
 
+import flashinfer.comm as flashinfer_comm
 
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
@@ -1499,10 +1500,9 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
-        use_flashinfer_allreduce: bool = False,
+        use_flashinfer_allreduce: bool = True,
     ):
         from ..distributed import AllReduce, FlashInferAllReduce
-        import flashinfer.comm as flashinfer_comm
 
         super().__init__()
         self.has_bias = bias
@@ -1680,7 +1680,7 @@ class Linear(nn.Module):
                 bias = None if fuse_bias else bias
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
 
-                if self.use_flashinfer_allreduce and output.size(0) <= 256:
+                if self.use_flashinfer_allreduce and output.size(0) <= 150:
                     output = self.flash_infer_all_reduce(
                         output,
                         all_reduce_params=all_reduce_params,
