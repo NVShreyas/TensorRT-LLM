@@ -15,7 +15,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
-                                     AllReduceStrategy, FlashInferAllReduce)
+                                     AllReduceStrategy, FlashInferAllReduceParams)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -1499,7 +1499,9 @@ class Linear(nn.Module):
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
+        use_flashinfer_allreduce: bool = False,
     ):
+        from ..distributed import AllReduce, FlashInferAllReduce
         import flashinfer.comm as flashinfer_comm
 
         super().__init__()
@@ -1537,15 +1539,17 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        # self.all_reduce = AllReduce(mapping=self.mapping,
-        #                             strategy=allreduce_strategy,
-        #                             dtype=self.dtype) if reduce_output else None
+        self.all_reduce = AllReduce(mapping=self.mapping,
+                                    strategy=allreduce_strategy,
+                                    dtype=self.dtype) if reduce_output else None
 
-        self.flash_infer_all_reduce = FlashInferAllReduce(
-            mapping=self.mapping,
-            hidden_dim=self.out_features,
-            strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
-            dtype=self.dtype) if reduce_output else None
+        self.use_flashinfer_allreduce = use_flashinfer_allreduce
+        if use_flashinfer_allreduce:
+            self.flash_infer_all_reduce = FlashInferAllReduce(
+                mapping=self.mapping,
+                hidden_dim=self.out_features,
+                strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
+                dtype=self.dtype) if reduce_output else None
 
         self._weights_created = False
         self.reduce_output = reduce_output
@@ -1675,14 +1679,17 @@ class Linear(nn.Module):
                     bias, all_reduce_params)
                 bias = None if fuse_bias else bias
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
-                # output = self.all_reduce(
-                #     output,
-                #     all_reduce_params=all_reduce_params,
-                # )
-                output = self.flash_infer_all_reduce(
-                    output,
-                    all_reduce_params=all_reduce_params,
-                )
+
+                if self.use_flashinfer_allreduce and output.size(0) <= 256:
+                    output = self.flash_infer_all_reduce(
+                        output,
+                        all_reduce_params=all_reduce_params,
+                    )
+                else:
+                    output = self.all_reduce(
+                        output,
+                        all_reduce_params=all_reduce_params,
+                    )
             else:
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
         elif self.tp_mode == TensorParallelMode.COLUMN:
