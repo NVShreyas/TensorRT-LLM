@@ -1,4 +1,6 @@
+import os
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -16,6 +18,10 @@ from .teacache import TeaCacheBackend
 if TYPE_CHECKING:
     from .config import DiffusionModelConfig
 
+# When set to "1", profiles only denoising steps 5-10 with the CUDA profiler.
+# All diffusion steps are identical, so a small window is sufficient.
+PROFILE_TRANSFORMER_ITERATION_ONLY = "TLLM_PROFILE_TRANSFORMER_ITERATION_ONLY"
+
 
 class BasePipeline(nn.Module):
     """
@@ -28,6 +34,7 @@ class BasePipeline(nn.Module):
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._is_in_warmup_state = False
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -35,6 +42,9 @@ class BasePipeline(nn.Module):
         self.text_encoder: Optional[nn.Module] = None
         self.tokenizer: Optional[Any] = None
         self.scheduler: Optional[Any] = None
+        
+        self._profile_transformer_only = (
+            os.environ.get(PROFILE_TRANSFORMER_ITERATION_ONLY, "0") == "1")
 
         # Initialize transformer
         self._init_transformer()
@@ -174,6 +184,39 @@ class BasePipeline(nn.Module):
         self.cache_backend = TeaCacheBackend(teacache_cfg)
         self.cache_backend.enable(model)
 
+    @contextmanager
+    def _profiler(self):
+        """Context manager that yields a profile_step(i) callable for CUDA profiler gating.
+
+        By default the CUDA profiler is left alone (captures everything).
+        When TLLM_PROFILE_TRANSFORMER_ITERATION_ONLY=1, starts the CUDA profiler
+        at step 5 and stops it after step 10 so that only a representative
+        window of identical denoising iterations is captured.
+        """
+        if not self._profile_transformer_only:
+            yield lambda i: None
+            return
+
+        PROF_START, PROF_STOP = 0, 10
+        enabled = False
+
+        def profile_step(i):
+            nonlocal enabled
+            if i == PROF_START and not self._is_in_warmup_state:
+                torch.cuda.cudart().cudaProfilerStart()
+                logger.info(f"CUDA profiler started at denoising step {i}.")
+                enabled = True
+            elif i == PROF_STOP and enabled:
+                torch.cuda.cudart().cudaProfilerStop()
+                logger.info(f"CUDA profiler stopped at denoising step {i}.")
+                enabled = False
+
+        try:
+            yield profile_step
+        finally:
+            if enabled:
+                torch.cuda.cudart().cudaProfilerStop()
+
     def torch_compile(self) -> None:
         """Apply torch.compile to pipeline components based on PipelineConfig.
 
@@ -259,10 +302,12 @@ class BasePipeline(nn.Module):
             f"and {warmup_steps} steps..."
         )
         warmup_start = time.time()
+        self._is_in_warmup_state = True
 
         self._run_warmup(warmup_steps)
 
         torch.cuda.synchronize()
+        self._is_in_warmup_state = False
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
 
@@ -626,64 +671,66 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
-        for i, t in enumerate(timesteps):
-            step_start = time.time()
+        with self._profiler() as profile_step:
+            for i, t in enumerate(timesteps):
+                profile_step(i)
+                step_start = time.time()
 
-            # Two-stage denoising: switch guidance scale at boundary
-            current_guidance_scale = guidance_scale
-            if guidance_scale_2 is not None and boundary_timestep is not None:
-                t_scalar = t.item() if t.dim() == 0 else t[0].item()
-                if t_scalar < boundary_timestep:
-                    current_guidance_scale = guidance_scale_2
+                # Two-stage denoising: switch guidance scale at boundary
+                current_guidance_scale = guidance_scale
+                if guidance_scale_2 is not None and boundary_timestep is not None:
+                    t_scalar = t.item() if t.dim() == 0 else t[0].item()
+                    if t_scalar < boundary_timestep:
+                        current_guidance_scale = guidance_scale_2
 
-            # Denoise
-            with nvtx_range(f"denoise_step {i}"):
-                if do_cfg_parallel:
-                    timestep = t.expand(latents.shape[0])
-                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
-                        latents,
-                        extra_stream_latents,
-                        timestep,
-                        cfg_config["local_embeds"],
-                        forward_fn,
-                        current_guidance_scale,
-                        guidance_rescale,
-                        cfg_config["ulysses_size"],
-                        local_extras,
-                    )
-                else:
-                    noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
-                        latents,
-                        extra_stream_latents,
-                        t,
-                        prompt_embeds,
-                        forward_fn,
-                        current_guidance_scale,
-                        guidance_rescale,
-                        local_extras,
-                    )
+                # Denoise
+                with nvtx_range(f"denoise_step {i}"):
+                    if do_cfg_parallel:
+                        timestep = t.expand(latents.shape[0])
+                        noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_cfg_parallel(
+                            latents,
+                            extra_stream_latents,
+                            timestep,
+                            cfg_config["local_embeds"],
+                            forward_fn,
+                            current_guidance_scale,
+                            guidance_rescale,
+                            cfg_config["ulysses_size"],
+                            local_extras,
+                        )
+                    else:
+                        noise_pred, extra_noise_preds, t_trans, t_cfg = self._denoise_step_standard(
+                            latents,
+                            extra_stream_latents,
+                            t,
+                            prompt_embeds,
+                            forward_fn,
+                            current_guidance_scale,
+                            guidance_rescale,
+                            local_extras,
+                        )
 
-            # Scheduler step for all streams
-            latents, extra_stream_latents, t_sched = self._scheduler_step(
-                latents,
-                extra_stream_latents,
-                noise_pred,
-                extra_noise_preds,
-                t,
-                scheduler,
-                extra_stream_schedulers,
-            )
-
-            # Logging
-            if self.rank == 0:
-                step_time = time.time() - step_start
-                avg_time = (time.time() - start_time) / (i + 1)
-                eta = avg_time * (total_steps - i - 1)
-                logger.info(
-                    f"Step {i + 1}/{total_steps} | {step_time:.2f}s "
-                    f"(trans={t_trans:.2f}s cfg={t_cfg:.3f}s sched={t_sched:.3f}s) | "
-                    f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
+                # Scheduler step for all streams
+                latents, extra_stream_latents, t_sched = self._scheduler_step(
+                    latents,
+                    extra_stream_latents,
+                    noise_pred,
+                    extra_noise_preds,
+                    t,
+                    scheduler,
+                    extra_stream_schedulers,
                 )
+
+                # Logging
+                if self.rank == 0:
+                    step_time = time.time() - step_start
+                    avg_time = (time.time() - start_time) / (i + 1)
+                    eta = avg_time * (total_steps - i - 1)
+                    logger.info(
+                        f"Step {i + 1}/{total_steps} | {step_time:.2f}s "
+                        f"(trans={t_trans:.2f}s cfg={t_cfg:.3f}s sched={t_sched:.3f}s) | "
+                        f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
+                    )
 
         if self.rank == 0:
             total_time = time.time() - start_time
