@@ -401,7 +401,7 @@ class VisualGenArgs(StrictBaseModel):
     def to_mapping(self) -> Mapping:
         """Derive Mapping from ParallelConfig."""
         return self.parallel.to_mapping()
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return self.model_dump()
