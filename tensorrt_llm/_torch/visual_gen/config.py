@@ -62,32 +62,25 @@ class AttentionConfig(StrictBaseModel):
 class ParallelConfig(StrictBaseModel):
     """Configuration for distributed parallelism.
 
-    Currently Supported:
+    Currently Supported (user-facing knobs):
         - dit_cfg_size: CFG (Classifier-Free Guidance) parallelism
         - dit_ulysses_size: Ulysses sequence parallelism
+        - dit_ring_size: Ring attention (context parallelism, ring impl)
 
     Not Yet Supported:
-        - dit_tp_size: Tensor parallelism (not implemented)
-        - dit_ring_size: Ring attention (not implemented)
-        - dit_cp_size, dit_dp_size, dit_fsdp_size: Other parallelism types
+        - dit_tp_size: Tensor parallelism
+        - dit_dp_size, dit_fsdp_size: Other parallelism types
 
-    See mapping.py for more details.
+    Context parallelism resolution (internal):
+        ``dit_ring_size`` derives the canonical pair ``(dit_cp_size,
+        dit_cp_impl)`` via the read-only properties of the same name, which is
+        what downstream components (mapping, pipeline_loader) consume.
 
     Example Configurations:
         1. cfg_size=1, ulysses_size=2 -> 2 GPUs (Ulysses only)
-           GPU 0-1: Single prompt, sequence parallelism across 2 GPUs
-
         2. cfg_size=2, ulysses_size=1 -> 2 GPUs (CFG only)
-           GPU 0: Positive prompt
-           GPU 1: Negative prompt
-
         3. cfg_size=2, ulysses_size=2 -> 4 GPUs (CFG + Ulysses)
-           GPU 0-1: CFG group 0 (positive), Ulysses parallel
-           GPU 2-3: CFG group 1 (negative), Ulysses parallel
-
-        4. cfg_size=2, ulysses_size=4 -> 8 GPUs (CFG + Ulysses)
-           GPU 0-3: CFG group 0 (positive), Ulysses parallel
-           GPU 4-7: CFG group 1 (negative), Ulysses parallel
+        4. cfg_size=2, ulysses_size=4, ring_size=2 -> 16 GPUs (CFG + Ulysses + Ring CP)
     """
 
     enable_parallel_vae: bool = True
@@ -96,10 +89,9 @@ class ParallelConfig(StrictBaseModel):
     # DiT Parallelism
     dit_dp_size: int = PydanticField(1, ge=1)
     dit_tp_size: int = PydanticField(1, ge=1)  # Not yet supported
-    dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
-    dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
-    dit_cp_size: int = PydanticField(1, ge=1)
-    dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
+    dit_ulysses_size: int = PydanticField(1, ge=1)
+    dit_ring_size: int = PydanticField(1, ge=1)
+    dit_cfg_size: int = PydanticField(1, ge=1)
     dit_fsdp_size: int = PydanticField(1, ge=1)
     dit_dim_order: str = PydanticField(
         DEFAULT_DIM_ORDER,
@@ -120,13 +112,35 @@ class ParallelConfig(StrictBaseModel):
 
     t5_fsdp_size: int = 1
 
+    # ------------------------------------------------------------------
+    # Derived canonical CP form consumed by mapping / pipeline_loader
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _derive_cp_size(ring: int) -> int:
+        return ring if ring > 1 else 1
+
+    @staticmethod
+    def _derive_cp_impl(ring: int) -> Optional[str]:
+        return "ring" if ring > 1 else None
+
+    @property
+    def dit_cp_size(self) -> int:
+        return self._derive_cp_size(self.dit_ring_size)
+
+    @property
+    def dit_cp_impl(self) -> Optional[str]:
+        return self._derive_cp_impl(self.dit_ring_size)
+
+    # ------------------------------------------------------------------
+    # World-size helpers
+    # ------------------------------------------------------------------
     @property
     def n_workers(self) -> int:
-        return self.dit_cfg_size * self.dit_ulysses_size
+        return self.dit_cfg_size * self.dit_ulysses_size * self.dit_cp_size
 
     @property
     def total_parallel_size(self) -> int:
-        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.dit_ulysses_size
+        return self.dit_cfg_size * self.dit_tp_size * self.dit_cp_size * self.dit_ulysses_size
 
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:

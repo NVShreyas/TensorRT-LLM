@@ -111,8 +111,9 @@ class PipelineLoader:
                 rk,
                 cfg_size=self.args.parallel.dit_cfg_size,
                 tp_size=self.args.parallel.dit_tp_size,
+                cp_size=self.args.parallel.dit_cp_size,
+                cp_impl=self.args.parallel.dit_cp_impl,
                 ulysses_size=self.args.parallel.dit_ulysses_size,
-                ring_size=self.args.parallel.dit_ring_size,
                 order=self.args.parallel.dit_dim_order,
             )
         else:
