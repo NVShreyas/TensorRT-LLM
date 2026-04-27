@@ -779,6 +779,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/auto_deploy/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
