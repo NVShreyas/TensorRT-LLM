@@ -100,7 +100,7 @@ class ParallelConfig(StrictBaseModel):
 
     # DiT Parallelism
     dit_dp_size: int = PydanticField(1, ge=1)
-    dit_tp_size: int = PydanticField(1, ge=1)  # Not yet supported
+    dit_tp_size: int = PydanticField(1, ge=1)  # WIP
     dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
     dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
@@ -143,7 +143,7 @@ class ParallelConfig(StrictBaseModel):
 
     @property
     def n_workers(self) -> int:
-        return self.dit_cfg_size * self.seq_parallel_size
+        return self.dit_cfg_size * self.dit_ulysses_size * self.dit_tp_size
 
     @property
     def total_parallel_size(self) -> int:
@@ -584,7 +584,7 @@ class DiffusionModelConfig(BaseModel):
     mapping: Mapping = PydanticField(default_factory=Mapping)
     skip_create_weights_in_init: bool = False
     force_dynamic_quantization: bool = False
-    allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.AUTO)
+    allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.NCCL)
     extra_attrs: Dict = PydanticField(default_factory=dict)
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)
