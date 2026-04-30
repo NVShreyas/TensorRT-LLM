@@ -332,19 +332,18 @@ def main():
     attn2d_size = args.attn2d_row_size * args.attn2d_col_size
     if attn2d_size > 1 and args.ulysses_size > 1:
         raise ValueError(
-            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
-        )
-    if args.ring_size > 1 and attn2d_size > 1:
-        raise ValueError(
-            "Combining --ring_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
-        )
-
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented.")
+    
     if args.ulysses_size > 1:
         num_heads = 40
         logger.info(
             f"Using Ulysses sequence parallelism: "
             f"{num_heads} heads / {args.ulysses_size} ranks = "
             f"{num_heads // args.ulysses_size} heads per GPU"
+        )
+    if args.ring_size > 1 and attn2d_size > 1:
+        raise ValueError(
+            "Combining --ring_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
 
     if args.ulysses_size > 1 or args.ring_size > 1:
