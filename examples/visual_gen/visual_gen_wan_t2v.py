@@ -245,7 +245,12 @@ def parse_args():
         default=1,
         help="TP group size",
     )
-    parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
+    parser.add_argument(
+        "--parallel_vae_size",
+        type=int,
+        default=1,
+        help="Number of ranks used for parallel VAE. 1 disables parallel VAE.",
+    )
 
     # CUDA graph
     parser.add_argument(
@@ -371,7 +376,7 @@ def main():
             "dit_attn2d_row_size": args.attn2d_row_size,
             "dit_attn2d_col_size": args.attn2d_col_size,
             "dit_tp_size": args.tp_size,
-            "enable_parallel_vae": not args.disable_parallel_vae,
+            "parallel_vae_size": args.parallel_vae_size,
         },
         torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
