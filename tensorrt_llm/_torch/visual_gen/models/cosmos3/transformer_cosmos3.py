@@ -388,6 +388,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             dtype=torch.bfloat16,
             config=model_config,
             layer_idx=layer_idx,
+            reduce_output=model_config.mapping.tp_size > 1,
         )
 
     def forward(
@@ -450,6 +451,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             dtype=torch.bfloat16,
             config=model_config,
             layer_idx=layer_idx,
+            reduce_output=model_config.mapping.tp_size > 1,
         )
 
     def forward(
@@ -668,11 +670,6 @@ class Cosmos3VFMTransformer(nn.Module):
         ulysses_size = vgm.ulysses_size if vgm else 1
         use_attn2d = attn2d_mesh_size > 1
         use_ulysses = ulysses_size > 1
-
-        if vgm is not None and vgm.tp_size > 1:
-            raise ValueError(
-                f"Cosmos3 does not support tensor parallelism. Got tp_size={vgm.tp_size}"
-            )
 
         if use_ulysses and (
             self.num_attention_heads % ulysses_size != 0 or self.num_kv_heads % ulysses_size != 0
