@@ -465,6 +465,24 @@ class Attention2DAttention(AttentionBackend):
 
         return output
 
+    def _ensure_buffers(self, q_full: torch.Tensor, k: torch.Tensor) -> None:
+        B, seq_len_full, H, D = q_full.shape
+        B, seq_len_shard, H_kv, D = k.shape
+        key = (B, seq_len_full, seq_len_shard, H, H_kv, D, k.device, k.dtype)
+        if key == self._kv_ring_buf_key:
+            return
+        del self._kv_ring_bufs, self._out_buf, self._lse_buf
+        self._kv_ring_bufs = None
+        self._out_buf = None
+        self._lse_buf = None
+
+        self._kv_ring_bufs = k.new_empty(2, 2, B, seq_len_shard, H_kv, D)
+        # Accumulate ring blocks in fp32 to avoid repeated bf16<->fp32 rounding
+        # across online-softmax merges
+        self._out_buf = k.new_empty(B, seq_len_full, H, D, dtype=torch.float32)
+        self._lse_buf = k.new_empty(B, H, seq_len_full, dtype=torch.float32)
+        self._kv_ring_buf_key = key
+
     def forward_overlapped(
         self,
         q: torch.Tensor,
@@ -486,36 +504,27 @@ class Attention2DAttention(AttentionBackend):
                 f"Attention2DAttention only supports FULL attention mask, got {attention_mask}."
             )
 
-        q_handle = None
         if self.row_group_size > 1:
             # Asynchronous All-gather q within row_process_group using a single flat buffer.
             # [B, S/P, H, D] → [row_group_size, B, S/P, H, D] → [B, S/col_group_size, H, D]
             q_recv = q.new_empty(self.row_group_size, B, shard_seq, H, D)
-            q_handle = torch.distributed.all_gather_into_tensor(
+            torch.distributed.all_gather_into_tensor(
                 q_recv.view(-1),
                 q.contiguous().view(-1),
                 group=self.row_process_group,
-                async_op=True,
             )
+            q = q_recv.permute(1, 0, 2, 3, 4).reshape(B, self.row_group_size * shard_seq, H, D)
 
-        buf_key = (B, shard_seq, H, D, k.device, k.dtype)
-        if self._kv_ring_buf_key != buf_key:
-            self._kv_ring_bufs = k.new_empty(2, 2, B, shard_seq, H, D)
-            self._kv_ring_buf_key = buf_key
+        self._ensure_buffers(q, k)
         kv_bufs = self._kv_ring_bufs
+        out = self._out_buf
+        lse = self._lse_buf
+
         kv_bufs[0, 0].copy_(k)
         kv_bufs[0, 1].copy_(v)
-        out = None
-        lse = None
-
-        if q_handle is not None:
-            q_handle.wait()
-            q_full = q_recv.permute(1, 0, 2, 3, 4).reshape(B, self.row_group_size * shard_seq, H, D)
-        else:
-            q_full = q
 
         if self._inner_layout == AttentionTensorLayout.HND:
-            q_full = q_full.transpose(1, 2)
+            q = q.transpose(1, 2)
 
         for step in range(self.col_group_size):
             cur, nxt = step % 2, 1 - step % 2
@@ -529,7 +538,7 @@ class Attention2DAttention(AttentionBackend):
                 k_cur, v_cur = k_cur.transpose(1, 2), v_cur.transpose(1, 2)
 
             block_out, block_lse_bh = self.inner_backend.forward_with_lse(
-                q=q_full,
+                q=q,
                 k=k_cur,
                 v=v_cur,
                 attention_mask=attention_mask,
@@ -544,8 +553,8 @@ class Attention2DAttention(AttentionBackend):
                 block_out = block_out.contiguous()
 
             if step == 0:
-                out = block_out.clone()
-                lse = block_lse_bh.clone()
+                out.copy_(block_out)
+                lse.copy_(block_lse_bh)
             else:
                 # Online-softmax merge with LSE in [B, H, S] (FA4 native).
                 c = torch.sigmoid(block_lse_bh - lse).transpose(1, 2).unsqueeze(-1)  # [B, S, H, 1]
@@ -555,12 +564,13 @@ class Attention2DAttention(AttentionBackend):
             if step < self.col_group_size - 1:
                 self._ring_comm.wait()
 
-        output = out
-
         if self.row_group_size > 1:
-            output = self._output_a2a(output, lse)
+            out = self._output_a2a(out, lse)
 
-        return output
+        if out.dtype != q.dtype:
+            out = out.to(dtype=q.dtype)
+
+        return out
 
     @torch.compiler.disable
     def _combine(
@@ -718,13 +728,13 @@ class RingAttention(AttentionBackend):
                 lse.copy_(block_lse)
             else:
                 self._update_out_and_lse(out, lse, block_out, block_lse)
-            
+
             if step < self.world_size - 1:
                 self._ring_comm.wait()
-        
+
         if out.dtype != q.dtype:
             return out.to(dtype=q.dtype)
-                
+
         return out
 
     @property
