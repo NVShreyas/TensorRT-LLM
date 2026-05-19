@@ -197,6 +197,42 @@ class UlyssesAttention(AttentionBackend):
         return True
 
 
+class RingComm:
+    def __init__(self, world_size: int, rank: int, pg: torch.distributed.ProcessGroup):
+        self.world_size = world_size
+        self.rank = rank
+        self.pg = pg
+
+        self._send_rank = dist.get_global_rank(pg, (rank + 1) % self.world_size)
+        self._recv_rank = dist.get_global_rank(pg, (rank - 1) % self.world_size)
+        self._send_first = rank % 2 == 0
+        self._p2p_reqs: list = []
+
+    def send_recv(
+        self,
+        send: torch.Tensor,
+        recv: torch.Tensor,
+    ) -> None:
+        """Post a non-blocking neighbor exchange. Even ranks send-then-recv to
+        avoid deadlock against odd ranks doing recv-then-send."""
+        if self._send_first:
+            ops = [
+                dist.P2POp(dist.isend, send, self._send_rank, group=self.pg),
+                dist.P2POp(dist.irecv, recv, self._recv_rank, group=self.pg),
+            ]
+        else:
+            ops = [
+                dist.P2POp(dist.irecv, recv, self._recv_rank, group=self.pg),
+                dist.P2POp(dist.isend, send, self._send_rank, group=self.pg),
+            ]
+        self._p2p_reqs = dist.batch_isend_irecv(ops)
+
+    def wait(self) -> None:
+        for r in self._p2p_reqs:
+            r.wait()
+        self._p2p_reqs.clear()
+
+
 class Attention2DAttention(AttentionBackend):
     """
     Attention2D Context Parallelism wrapper for video-generation inference.
@@ -294,6 +330,7 @@ class Attention2DAttention(AttentionBackend):
         # Always NHD: all-gather kernels operate on [B, S/P, H, D]. Any HND conversion
         # needed by the inner backend is handled internally in forward.
         self._preferred_layout = AttentionTensorLayout.NHD
+        self.enable_overlapped = False
 
         if _flash_attn_combine is None:
             raise ImportError(
@@ -324,22 +361,55 @@ class Attention2DAttention(AttentionBackend):
                 f"{type(inner_backend).__name__} uses unsupported layout: {self._inner_layout}"
             )
 
+        col_ring_rank = torch.distributed.get_rank(group=col_process_group)
+        self._ring_comm = RingComm(self.col_group_size, col_ring_rank, col_process_group)
+
+        self._kv_ring_bufs: torch.Tensor | None = None
+        self._kv_ring_buf_key: tuple | None = None
+        self._out_buf = None
+        self._lse_buf = None
+
+    def _output_a2a(self, output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        # Reduce-scatter output+lse along sequence within row_process_group,
+        # implemented as all_to_all_single + local LSE-based reduce.
+        N = self.row_group_size
+        B, seq_row, H, D = output.shape  # seq_row = S/col_group_size = N * (S/P)
+        shard_seq = seq_row // N
+
+        # output: [B, seq_row, H, D] → [N, B, shard_seq, H, D] (grouped by dest rank)
+        o_send = output.view(B, N, shard_seq, H, D).permute(1, 0, 2, 3, 4).contiguous()
+        o_recv = torch.empty_like(o_send)
+        torch.distributed.all_to_all_single(o_recv, o_send, group=self.row_process_group)
+        # o_recv: [N, B, shard_seq, H, D] — already stacked by source rank
+
+        # lse: [B, H, seq_row] → [N, B, H, shard_seq] (grouped by dest rank)
+        lse_send = lse.view(B, H, N, shard_seq).permute(2, 0, 1, 3).contiguous()
+        lse_recv = torch.empty_like(lse_send)
+        torch.distributed.all_to_all_single(lse_recv, lse_send, group=self.row_process_group)
+        # lse_recv: [N, B, H, shard_seq] — already stacked by source rank
+
+        # flash_attn_combine expects lse as [N, B, S/P, H] with stride(-2)==1;
+        # do not call .contiguous() after permute as it would reset the strides.
+        lse_recv = lse_recv.permute(0, 1, 3, 2)  # [N, B, shard_seq, H]
+        output, _ = self._combine(o_recv, lse_recv, output.dtype)
+
+        return output
+
     def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        *,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Forward pass with Attention2D sequence parallelism.
+        if self.enable_overlapped and self.col_group_size > 1:
+            return self.forward_overlapped(q, k, v, attention_mask=attention_mask, **kwargs)
 
-        q/k/v: [B, S/P, H, D] each.
-        """
         B, shard_seq, H, D = q.shape
-        attention_mask = kwargs.get("attention_mask", None)
 
-        if attention_mask is not None and attention_mask != PredefinedAttentionMask.FULL:
+        if attention_mask != PredefinedAttentionMask.FULL:
             raise ValueError(
                 f"Attention2DAttention only supports FULL attention mask, got {attention_mask}."
             )
@@ -391,28 +461,104 @@ class Attention2DAttention(AttentionBackend):
             output = output.contiguous()
 
         if self.row_group_size > 1:
-            # Reduce-scatter output+lse along sequence within row_process_group,
-            # implemented as all_to_all_single + local LSE-based reduce.
-            N = self.row_group_size
-            B, seq_row, H, D = output.shape  # seq_row = S/col_group_size = N * (S/P)
-            shard_seq = seq_row // N
+            output = self._output_a2a(output, lse)
 
-            # output: [B, seq_row, H, D] → [N, B, shard_seq, H, D] (grouped by dest rank)
-            o_send = output.view(B, N, shard_seq, H, D).permute(1, 0, 2, 3, 4).contiguous()
-            o_recv = torch.empty_like(o_send)
-            torch.distributed.all_to_all_single(o_recv, o_send, group=self.row_process_group)
-            # o_recv: [N, B, shard_seq, H, D] — already stacked by source rank
+        return output
 
-            # lse: [B, H, seq_row] → [N, B, H, shard_seq] (grouped by dest rank)
-            lse_send = lse.view(B, H, N, shard_seq).permute(2, 0, 1, 3).contiguous()
-            lse_recv = torch.empty_like(lse_send)
-            torch.distributed.all_to_all_single(lse_recv, lse_send, group=self.row_process_group)
-            # lse_recv: [N, B, H, shard_seq] — already stacked by source rank
+    def forward_overlapped(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass with Attention2D sequence parallelism.
 
-            # flash_attn_combine expects lse as [N, B, S/P, H] with stride(-2)==1;
-            # do not call .contiguous() after permute as it would reset the strides.
-            lse_recv = lse_recv.permute(0, 1, 3, 2)  # [N, B, shard_seq, H]
-            output, _ = self._combine(o_recv, lse_recv, output.dtype)
+        q/k/v: [B, S/P, H, D] each.
+        """
+        B, shard_seq, H, D = q.shape
+
+        if attention_mask != PredefinedAttentionMask.FULL:
+            raise ValueError(
+                f"Attention2DAttention only supports FULL attention mask, got {attention_mask}."
+            )
+
+        q_handle = None
+        if self.row_group_size > 1:
+            # Asynchronous All-gather q within row_process_group using a single flat buffer.
+            # [B, S/P, H, D] → [row_group_size, B, S/P, H, D] → [B, S/col_group_size, H, D]
+            q_recv = q.new_empty(self.row_group_size, B, shard_seq, H, D)
+            q_handle = torch.distributed.all_gather_into_tensor(
+                q_recv.view(-1),
+                q.contiguous().view(-1),
+                group=self.row_process_group,
+                async_op=True,
+            )
+
+        buf_key = (B, shard_seq, H, D, k.device, k.dtype)
+        if self._kv_ring_buf_key != buf_key:
+            self._kv_ring_bufs = k.new_empty(2, 2, B, shard_seq, H, D)
+            self._kv_ring_buf_key = buf_key
+        kv_bufs = self._kv_ring_bufs
+        kv_bufs[0, 0].copy_(k)
+        kv_bufs[0, 1].copy_(v)
+        out = None
+        lse = None
+
+        if q_handle is not None:
+            q_handle.wait()
+            q_full = q_recv.permute(1, 0, 2, 3, 4).reshape(B, self.row_group_size * shard_seq, H, D)
+        else:
+            q_full = q
+
+        if self._inner_layout == AttentionTensorLayout.HND:
+            q_full = q_full.transpose(1, 2)
+
+        for step in range(self.col_group_size):
+            cur, nxt = step % 2, 1 - step % 2
+
+            if step < self.col_group_size - 1:
+                self._ring_comm.send_recv(kv_bufs[cur], kv_bufs[nxt])
+
+            k_cur = kv_bufs[cur, 0]
+            v_cur = kv_bufs[cur, 1]
+            if self._inner_layout == AttentionTensorLayout.HND:
+                k_cur, v_cur = k_cur.transpose(1, 2), v_cur.transpose(1, 2)
+
+            block_out, block_lse_bh = self.inner_backend.forward_with_lse(
+                q=q_full,
+                k=k_cur,
+                v=v_cur,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+
+            if self._inner_layout == AttentionTensorLayout.HND:
+                block_out = block_out.transpose(1, 2).contiguous()
+            else:
+                if block_out.dim() == 3:
+                    block_out = block_out.view(B, -1, self.num_heads, self.head_dim)
+                block_out = block_out.contiguous()
+
+            if step == 0:
+                out = block_out.clone()
+                lse = block_lse_bh.clone()
+            else:
+                # Online-softmax merge with LSE in [B, H, S] (FA4 native).
+                c = torch.sigmoid(block_lse_bh - lse).transpose(1, 2).unsqueeze(-1)  # [B, S, H, 1]
+                out.sub_(c * (out - block_out))
+                lse.sub_(F.logsigmoid(lse - block_lse_bh))
+
+            if step < self.col_group_size - 1:
+                self._ring_comm.wait()
+
+        output = out
+
+        if self.row_group_size > 1:
+            output = self._output_a2a(output, lse)
 
         return output
 
@@ -496,35 +642,12 @@ class RingAttention(AttentionBackend):
 
         # P2P ring topology cached at construction time (avoids per-step lookups).
         ring_rank = dist.get_rank(group=process_group)
-        self._send_rank = dist.get_global_rank(process_group, (ring_rank + 1) % self.world_size)
-        self._recv_rank = dist.get_global_rank(process_group, (ring_rank - 1) % self.world_size)
-        self._send_first = ring_rank % 2 == 0
-        self._p2p_reqs: list = []
+        self._ring_comm = RingComm(self.world_size, ring_rank, process_group)
 
         self._buf_key = None
         self._kv_bufs = None
         self._out_buf = None
         self._lse_buf = None
-
-    def _ring_send_recv(self, send: torch.Tensor, recv: torch.Tensor) -> None:
-        """Post a non-blocking neighbor exchange. Even ranks send-then-recv to
-        avoid deadlock against odd ranks doing recv-then-send."""
-        if self._send_first:
-            ops = [
-                dist.P2POp(dist.isend, send, self._send_rank, group=self.pg),
-                dist.P2POp(dist.irecv, recv, self._recv_rank, group=self.pg),
-            ]
-        else:
-            ops = [
-                dist.P2POp(dist.irecv, recv, self._recv_rank, group=self.pg),
-                dist.P2POp(dist.isend, send, self._send_rank, group=self.pg),
-            ]
-        self._p2p_reqs = dist.batch_isend_irecv(ops)
-
-    def _ring_wait(self) -> None:
-        for r in self._p2p_reqs:
-            r.wait()
-        self._p2p_reqs.clear()
 
     def _ensure_buffers(self, q: torch.Tensor, k: torch.Tensor) -> None:
         B, S, H, D = q.shape
@@ -580,7 +703,7 @@ class RingAttention(AttentionBackend):
         for step in range(self.world_size):
             cur, nxt = step % 2, 1 - step % 2
             if step < self.world_size - 1:
-                self._ring_send_recv(kv_bufs[cur], kv_bufs[nxt])
+                self._ring_comm.send_recv(kv_bufs[cur], kv_bufs[nxt])
             block_out, block_lse_bh = self.inner.forward_with_lse(
                 q=q,
                 k=kv_bufs[cur, 0],
@@ -595,10 +718,13 @@ class RingAttention(AttentionBackend):
                 lse.copy_(block_lse)
             else:
                 self._update_out_and_lse(out, lse, block_out, block_lse)
+            
             if step < self.world_size - 1:
-                self._ring_wait()
+                self._ring_comm.wait()
+        
         if out.dtype != q.dtype:
             return out.to(dtype=q.dtype)
+                
         return out
 
     @property
