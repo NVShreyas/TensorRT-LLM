@@ -159,7 +159,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         if self._use_attn2d_plane:
             dim_order = _DEVICE_MESH_DIM_ORDER_ATTN2D
-            dims = dim_order.split("-")
+            self._dim_names = dim_order.split("-")
             self._dim_sizes = {
                 "cfg": cfg_size,
                 "tp": tp_size,
@@ -169,7 +169,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             }
         else:
             dim_order = _DEVICE_MESH_DIM_ORDER_LEGACY
-            dims = dim_order.split("-")
+            self._dim_names = dim_order.split("-")
             self._dim_sizes = {
                 "cfg": cfg_size,
                 "tp": tp_size,
@@ -479,20 +479,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         if self.cp_size * self.ulysses_size == 1:
             # Degenerate: single rank along both dims.  Fall back to the
             # ulysses group (equivalent at size-1) to keep call sites simple.
-            return self._group("ulysses")
-        if VisualGenMapping.seq_mesh is None:
-            return None
-        return VisualGenMapping.seq_mesh.get_group()
-
-    @property
-    def seq_group(self) -> Optional[ProcessGroup]:
-        """Process group spanning the flattened (CP × Ulysses) sequence mesh."""
-        cls = DeviceMeshTopologyImpl
-        if cls.device_mesh is None:
-            if self.world_size == 1:
-                return SingleProcessGroup.get_group()
-            return None
-        if self.seq_size == 1:
             return self._group("ulysses")
         if VisualGenMapping.seq_mesh is None:
             return None
