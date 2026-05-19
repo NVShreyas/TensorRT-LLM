@@ -356,6 +356,29 @@ CacheConfig = Annotated[
 ]
 
 
+class SpeculativeConfig(StrictBaseModel):
+    """Configuration for ASDSV speculative denoising (draft + target transformer).
+
+    Requires a separate draft checkpoint (e.g. Wan2.1-T2V-1.3B) alongside the
+    target model (e.g. Wan2.1-T2V-14B).  The draft runs K steps cheaply; the
+    target verifies via two anchor evaluations per round.
+
+    Default values match ASDSV-slow (NeurIPS 2025).
+    For ASDSV-fast set gamma_1=gamma_2=9.
+    """
+
+    draft_checkpoint_path: str = PydanticField("", description="Path to draft model checkpoint.")
+    gamma_1: int = PydanticField(2, ge=2, description="Conservative window size — Stage-1.")
+    gamma_2: int = PydanticField(9, ge=2, description="Aggressive window size — Stage-2.")
+    delta: float = PydanticField(0.2, gt=0.0, description="Per-element L1 verification threshold.")
+    warmup_ratio: float = PydanticField(
+        0.10, ge=0.0, lt=1.0, description="Fraction of steps run target-only (Stage-0)."
+    )
+    stage1_ratio: float = PydanticField(
+        0.25, ge=0.0, lt=1.0, description="Fraction of steps using conservative gamma_1 (Stage-1)."
+    )
+
+
 class TorchCompileConfig(StrictBaseModel):
     """Configuration for torch.compile and autotuning.
 
@@ -539,6 +562,7 @@ class VisualGenArgs(StrictBaseModel):
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    speculative: Optional[SpeculativeConfig] = None
 
     # Set by model_validator when quant_config is provided as a dict (ModelOpt format)
     dynamic_weight_quant: bool = False
@@ -693,6 +717,7 @@ class DiffusionModelConfig(BaseModel):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    speculative: Optional[SpeculativeConfig] = None
 
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:
@@ -940,6 +965,7 @@ class DiffusionModelConfig(BaseModel):
         attention_cfg = args.attention if args else AttentionConfig()
         parallel_cfg = args.parallel if args else ParallelConfig()
         cache_cfg = args.cache if args else None
+        speculative_cfg = args.speculative if args else None
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
@@ -1070,6 +1096,7 @@ class DiffusionModelConfig(BaseModel):
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
+            speculative=speculative_cfg,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,

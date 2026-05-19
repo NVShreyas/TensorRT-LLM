@@ -232,6 +232,21 @@ class PipelineLoader:
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
+        if (
+            self.args is not None
+            and self.args.speculative is not None
+            and self.args.speculative.draft_checkpoint_path
+        ):
+            from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+            if not isinstance(pipeline, WanPipeline):
+                raise ValueError(
+                    f"Speculative decoding is currently only supported for WanPipeline, "
+                    f"got {type(pipeline).__name__}."
+                )
+            draft_ckpt = self._resolve_checkpoint_dir(self.args.speculative.draft_checkpoint_path)
+            pipeline.load_draft_weights(draft_ckpt)
+
         if config.torch_compile.enable_torch_compile:
             torch._dynamo.config.cache_size_limit = 128
             pipeline.torch_compile()

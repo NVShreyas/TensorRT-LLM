@@ -84,6 +84,8 @@ class WanPipeline(BasePipeline):
     def __init__(self, model_config):
         # Wan2.2 A14B two-stage denoising parameters
         self.transformer_2 = None
+        # ASDSV speculative decoding: cheap draft transformer (e.g. 1.3B)
+        self.draft_transformer = None
         self.boundary_ratio = getattr(model_config.pretrained_config, "boundary_ratio", None)
         self.expand_timesteps = getattr(model_config.pretrained_config, "expand_timesteps", False)
         # Derived model type flags
@@ -315,6 +317,35 @@ class WanPipeline(BasePipeline):
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
 
+    def load_draft_weights(self, draft_ckpt_path: str) -> None:
+        """Load a draft transformer (e.g. Wan2.1-1.3B) for speculative decoding.
+
+        The draft shares the same WanTransformer3DModel architecture but with a
+        smaller config.  It is loaded directly (no MetaInit) since the main
+        pipeline is already fully initialized.
+        """
+        from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
+        from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+
+        logger.info(f"Loading draft transformer from {draft_ckpt_path}...")
+
+        draft_model_config = DiffusionModelConfig.from_pretrained(draft_ckpt_path)
+        # Override: we are not in MetaInitMode, so allocate real tensors immediately.
+        draft_model_config.skip_create_weights_in_init = False
+        # Inherit distributed mapping from the target model.
+        draft_model_config.visual_gen_mapping = self.model_config.visual_gen_mapping
+        draft_model_config.mapping = self.model_config.mapping
+
+        self.draft_transformer = WanTransformer3DModel(model_config=draft_model_config)
+        self.draft_transformer.eval().to(self.device).to(self.dtype)
+
+        weight_loader = WeightLoader(components=["transformer"])
+        draft_weights_dict = weight_loader.load_weights(draft_ckpt_path, self.mapping)
+        draft_weights = draft_weights_dict.get("transformer", draft_weights_dict)
+        self.draft_transformer.load_weights(draft_weights)
+
+        logger.info("Draft transformer loaded.")
+
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
             self.forward(
@@ -544,19 +575,63 @@ class WanPipeline(BasePipeline):
 
         post_step_fn = _pin_i2v_first_frame if (self.is_wan22_5b and is_i2v) else None
 
-        # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
+        # Denoising: speculative (ASDSV) if draft is loaded, otherwise standard.
+        spec_config = self.model_config.speculative
+        spec_stats = None
+
         timer.mark_denoise_start()
-        latents = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=prompt_embeds,
-            neg_prompt_embeds=neg_prompt_embeds,
-            guidance_scale=guidance_scale,
-            forward_fn=forward_fn,
-            guidance_scale_2=guidance_scale_2,
-            boundary_timestep=boundary_timestep,
-            post_step_fn=post_step_fn,
-        )
+        if spec_config is not None and self.draft_transformer is not None:
+            from tensorrt_llm._torch.visual_gen.models.wan.speculative import (
+                _make_cfg_noise_fn,
+                speculative_denoise,
+            )
+
+            def draft_forward_fn(
+                hidden_states, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
+            ):
+                return self.draft_transformer(
+                    hidden_states=hidden_states,
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states,
+                )
+
+            target_noise = _make_cfg_noise_fn(
+                forward_fn, guidance_scale, prompt_embeds, neg_prompt_embeds
+            )
+            draft_noise = _make_cfg_noise_fn(
+                draft_forward_fn, guidance_scale, prompt_embeds, neg_prompt_embeds
+            )
+
+            latents, spec_stats = speculative_denoise(
+                latents=latents,
+                timesteps=self.scheduler.timesteps,
+                sigmas=self.scheduler.sigmas,
+                target_noise_fn=target_noise,
+                draft_noise_fn=draft_noise,
+                spec_config=spec_config,
+            )
+
+            if self.rank == 0:
+                logger.info(
+                    f"Speculative decoding complete: "
+                    f"acceptance={spec_stats.acceptance_rate:.1%}, "
+                    f"target_calls={spec_stats.total_target_calls}, "
+                    f"draft_calls={spec_stats.total_draft_calls}, "
+                    f"accepted_rounds={spec_stats.accepted_rounds}, "
+                    f"rejected_rounds={spec_stats.rejected_rounds}"
+                )
+        else:
+            latents = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=prompt_embeds,
+                neg_prompt_embeds=neg_prompt_embeds,
+                guidance_scale=guidance_scale,
+                forward_fn=forward_fn,
+                guidance_scale_2=guidance_scale_2,
+                boundary_timestep=boundary_timestep,
+                post_step_fn=post_step_fn,
+            )
         timer.mark_post_start()
 
         # Decode
@@ -569,7 +644,9 @@ class WanPipeline(BasePipeline):
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
         timer.mark_end()
-        return timer.fill(PipelineOutput(video=video, frame_rate=16.0))
+        return timer.fill(
+            PipelineOutput(video=video, frame_rate=16.0, speculative_stats=spec_stats)
+        )
 
     @nvtx_range("_encode_prompt", color="blue")
     def _encode_prompt(

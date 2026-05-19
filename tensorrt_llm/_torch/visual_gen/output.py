@@ -21,7 +21,7 @@ occurs when the response is consumed.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -75,6 +75,7 @@ class PipelineOutput:
     pre_denoise: float = 0.0
     denoise: float = 0.0
     post_denoise: float = 0.0
+    speculative_stats: Optional[Any] = None  # SpecStats when speculative decoding is active
 
 
 class CudaPhaseTimer:
