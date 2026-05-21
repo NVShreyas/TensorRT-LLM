@@ -377,6 +377,12 @@ def build_diffusion_args(args) -> VisualGenArgs:
 def main():
     args = parse_args()
 
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if args.ring_size > 1 and attn2d_size > 1:
+        raise ValueError(
+            "Combining --ring_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
+
     parallel_str = (
         f"CFG(size={getattr(args, 'cfg_size', 1)}) + "
         f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}) + "

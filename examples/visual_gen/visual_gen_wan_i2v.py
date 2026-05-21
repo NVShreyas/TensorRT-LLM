@@ -353,10 +353,6 @@ def main():
         cache_kwargs = {}
 
     attn2d_size = args.attn2d_row_size * args.attn2d_col_size
-    if attn2d_size > 1 and args.ulysses_size > 1:
-        raise ValueError(
-            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
-        )
     if args.ring_size > 1 and attn2d_size > 1:
         raise ValueError(
             "Combining --ring_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."

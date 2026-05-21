@@ -387,6 +387,12 @@ def main():
             f"--distilled_lora_path, but {missing} was not provided."
         )
 
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if args.ring_size > 1 and attn2d_size > 1:
+        raise ValueError(
+            "Combining --ring_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
+
     diffusion_args = _build_diffusion_args(args)
 
     parallel_str = (
