@@ -5,10 +5,10 @@ import torch
 import torch.nn as nn
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
-from ..modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
 from ..config import DiffusionModelConfig
+from ..modules.rms_norm import RMSNorm
 
 
 class QKVMode(str, Enum):
@@ -61,7 +61,7 @@ class Attention(nn.Module):
         self.mapping = getattr(config, "mapping", None)
         self.allreduce_strategy = config.allreduce_strategy
 
-        tp_size = self.mapping.tp_size if self.mapping else 1
+        self.tp_size = self.mapping.tp_size if self.mapping else 1
 
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -105,7 +105,7 @@ class Attention(nn.Module):
 
             q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
             k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
-            enable_tp_rms = (tp_size > 1) and qk_norm_mode == "full"
+            enable_tp_rms = (self.tp_size > 1) and qk_norm_mode == "full"
             self.norm_q = RMSNorm(
                 hidden_size=q_norm_dim,
                 eps=self.eps,
@@ -135,8 +135,8 @@ class Attention(nn.Module):
                     quant_config=self.quant_config,
                     skip_create_weights_in_init=self.skip_create_weights_in_init,
                     force_dynamic_quantization=self.force_dynamic_quantization,
-                    tensor_parallel_mode=TensorParallelMode.ROW if tp_size > 1 else None,
-                    reduce_output=(tp_size > 1),
+                    tensor_parallel_mode=TensorParallelMode.ROW if self.tp_size > 1 else None,
+                    reduce_output=(self.tp_size > 1),
                     allreduce_strategy=self.allreduce_strategy,
                 )
             ]
@@ -158,15 +158,15 @@ class Attention(nn.Module):
             backend_num_heads = self.num_attention_heads
             backend_num_kv_heads = self.num_key_value_heads
 
-        if tp_size > 1:
-            assert backend_num_heads % tp_size == 0
-            backend_num_heads = backend_num_heads // tp_size
+        if self.tp_size > 1:
+            assert backend_num_heads % self.tp_size == 0
+            backend_num_heads = backend_num_heads // self.tp_size
 
-            assert backend_num_kv_heads % tp_size == 0
-            backend_num_kv_heads = backend_num_kv_heads // tp_size
+            assert backend_num_kv_heads % self.tp_size == 0
+            backend_num_kv_heads = backend_num_kv_heads // self.tp_size
 
-            self.num_attention_heads //= tp_size
-            self.num_key_value_heads //= tp_size
+            self.num_attention_heads //= self.tp_size
+            self.num_key_value_heads //= self.tp_size
 
             self.q_dim = self.num_attention_heads * self.head_dim
             self.kv_dim = self.num_key_value_heads * self.head_dim
@@ -202,10 +202,13 @@ class Attention(nn.Module):
             )
 
     def _init_qkv_proj(self) -> None:
-        tp_mode = TensorParallelMode.COLUMN if self.mapping.tp_size > 1 else None
+        tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
             qkv_out_dim = self.q_dim + 2 * self.kv_dim
+            q_dim_local = self.q_dim // self.tp_size
+            kv_dim_local = self.kv_dim // self.tp_size
+
             self.qkv_proj = Linear(
                 self.hidden_size,
                 qkv_out_dim,
@@ -219,9 +222,9 @@ class Attention(nn.Module):
                     weight_mode=WeightMode.FUSED_QKV_LINEAR
                 ),
                 fused_weight_shard_indices_mapping={
-                    "q": (0, self.q_dim),
-                    "k": (self.q_dim, self.kv_dim),
-                    "v": (self.q_dim + self.kv_dim, self.kv_dim),
+                    "q": (0, q_dim_local),
+                    "k": (q_dim_local, kv_dim_local),
+                    "v": (q_dim_local + kv_dim_local, kv_dim_local),
                 },
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
