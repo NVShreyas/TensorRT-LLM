@@ -7,6 +7,7 @@ All pipelines (Wan, Flux, Flux2, LTX2) register via @register_pipeline decorator
 
 import json
 import os
+from enum import Enum
 from typing import TYPE_CHECKING, Dict, Type
 
 from tensorrt_llm.logger import logger
@@ -17,6 +18,27 @@ if TYPE_CHECKING:
 
 # Global registry: pipeline_name -> pipeline_class
 PIPELINE_REGISTRY: Dict[str, Type["BasePipeline"]] = {}
+
+
+class PipelineComponent(str, Enum):
+    """Identifiers for Diffusers-pipeline components.
+
+    Inherits from ``str`` so values compare equal to plain strings,
+    e.g. ``PipelineComponent.VAE == "vae"`` is ``True``. The loader reads
+    these from ``model_index.json``.
+    """
+
+    TRANSFORMER = "transformer"
+    VAE = "vae"
+    TEXT_ENCODER = "text_encoder"
+    TEXT_ENCODER_2 = "text_encoder_2"
+    TOKENIZER = "tokenizer"
+    TOKENIZER_2 = "tokenizer_2"
+    SCHEDULER = "scheduler"
+    IMAGE_ENCODER = "image_encoder"
+    IMAGE_PROCESSOR = "image_processor"
+    TEXT_GUARDRAIL = "text_guardrail"
+    VIDEO_GUARDRAIL = "video_guardrail"
 
 
 def register_pipeline(name: str):
