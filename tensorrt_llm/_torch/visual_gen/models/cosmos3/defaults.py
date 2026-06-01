@@ -62,3 +62,25 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description="Whether to enable audio generation.",
     ),
 }
+
+# Internal Cosmos3 conditioning defaults (latent frame indices). Not exposed via
+# extra_param_specs; the pipeline selects these based on the conditioning input.
+COSMOS3_CONDITION_FRAME_INDEXES_I2V = [0]
+COSMOS3_CONDITION_FRAME_INDEXES_V2V = [0, 1]
+
+
+def cosmos3_condition_frame_indexes_for_input(*, has_video_input: bool) -> list[int]:
+    """Return default latent vision conditioning indexes for I2V vs V2V."""
+    return list(
+        COSMOS3_CONDITION_FRAME_INDEXES_V2V
+        if has_video_input
+        else COSMOS3_CONDITION_FRAME_INDEXES_I2V
+    )
+
+
+def cosmos3_condition_frame_indexes_inverse_dynamics(
+    num_frames: int, temporal_compression: int = 4
+) -> list[int]:
+    """All latent frames are conditioned for inverse-dynamics (video in, actions out)."""
+    latent_frames = (num_frames - 1) // temporal_compression + 1
+    return list(range(latent_frames))

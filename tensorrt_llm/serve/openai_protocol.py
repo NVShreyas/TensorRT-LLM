@@ -1470,7 +1470,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
     prompt: str
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
-        description="Optional image reference that guides generation.")
+        description="Optional image/video reference that guides generation.")
     model: Optional[str] = None
     size: Optional[str] = Field(
         default="auto",

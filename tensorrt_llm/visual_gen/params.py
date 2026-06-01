@@ -14,7 +14,7 @@
 # limitations under the License.
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 
@@ -65,6 +65,16 @@ class VisualGenParams(StrictBaseModel):
     image_cond_strength: Optional[float] = Field(
         default=None, description="Image conditioning strength."
     )
+    video: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
+        default=None,
+        description="Reference video for output conditioning (path, bytes, or URL).",
+    )
+
+    @model_validator(mode="after")
+    def _validate_conditioning_inputs(self) -> "VisualGenParams":
+        if self.image is not None and self.video is not None:
+            raise ValueError("Only one of 'image' or 'video' may be set as a conditioning input.")
+        return self
 
     # Per-prompt multiplier
     num_images_per_prompt: int = Field(default=1, description="Number of images per prompt.")

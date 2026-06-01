@@ -1,8 +1,7 @@
 import asyncio
 import base64
 import os
-import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm.serve.openai_protocol import (
     ImageEditRequest,
@@ -10,6 +9,78 @@ from tensorrt_llm.serve.openai_protocol import (
     VideoGenerationRequest,
 )
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+
+_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+def _detect_reference_media_type(
+    data: bytes,
+    *,
+    filename: Optional[str] = None,
+    content_type: Optional[str] = None,
+) -> Literal["image", "video"]:
+    """Classify an input_reference payload as image or video conditioning."""
+    if filename:
+        ext = os.path.splitext(filename.lower())[1]
+        if ext in _VIDEO_EXTENSIONS:
+            return "video"
+        if ext in _IMAGE_EXTENSIONS:
+            return "image"
+
+    if content_type:
+        if content_type.startswith("video/"):
+            return "video"
+        if content_type.startswith("image/"):
+            return "image"
+
+    if data.startswith(b"\x89PNG") or data.startswith(b"\xff\xd8\xff"):
+        return "image"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return "video"
+    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"AVI ":
+        return "video"
+
+    # Preserve legacy behavior: unknown payloads are treated as images.
+    return "image"
+
+
+def _reference_file_extension(
+    media_type: Literal["image", "video"],
+    filename: Optional[str] = None,
+) -> str:
+    if filename:
+        ext = os.path.splitext(filename.lower())[1]
+        if ext:
+            return ext
+    return ".mp4" if media_type == "video" else ".png"
+
+
+def _read_input_reference(
+    input_reference,
+) -> Tuple[bytes, Optional[str], Optional[str]]:
+    if isinstance(input_reference, str):
+        return base64.b64decode(input_reference), None, None
+
+    filename = getattr(input_reference, "filename", None)
+    content_type = getattr(input_reference, "content_type", None)
+    data = input_reference.file.read()
+    return data, filename, content_type
+
+
+def _save_input_reference(
+    input_reference,
+    *,
+    request_id: str,
+    media_storage_path: str,
+) -> Tuple[str, Literal["image", "video"]]:
+    data, filename, content_type = _read_input_reference(input_reference)
+    media_type = _detect_reference_media_type(data, filename=filename, content_type=content_type)
+    ext = _reference_file_extension(media_type, filename)
+    ref_path = os.path.join(media_storage_path, f"{request_id}_reference{ext}")
+    with open(ref_path, "wb") as f:
+        f.write(data)
+    return ref_path, media_type
 
 
 def parse_visual_gen_params(
@@ -57,17 +128,19 @@ def parse_visual_gen_params(
             params.num_inference_steps = request.num_inference_steps
         if request.n is not None:
             params.num_images_per_prompt = request.n
+
         if request.input_reference is not None:
             if media_storage_path is None:
                 raise ValueError("media_storage_path is required when input_reference is provided")
-            ref_path = os.path.join(media_storage_path, f"{id}_reference.png")
-            if isinstance(request.input_reference, str):
-                with open(ref_path, "wb") as f:
-                    f.write(base64.b64decode(request.input_reference))
+            ref_path, media_type = _save_input_reference(
+                request.input_reference,
+                request_id=id,
+                media_storage_path=media_storage_path,
+            )
+            if media_type == "video":
+                params.video = ref_path
             else:
-                with open(ref_path, "wb") as f:
-                    shutil.copyfileobj(request.input_reference.file, f)
-            params.image = ref_path
+                params.image = ref_path
 
         params.frame_rate = request.fps
         params.num_frames = int(request.seconds * request.fps)

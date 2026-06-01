@@ -22,7 +22,6 @@ import PIL.Image
 import torch
 from diffusers import AutoencoderKLWan, UniPCMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
@@ -32,10 +31,15 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
-from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS
+from .defaults import (
+    COSMOS3_720P_PARAMS,
+    COSMOS3_EXTRA_SPECS,
+    cosmos3_condition_frame_indexes_for_input,
+)
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import Cosmos3VFMTransformer
+from .vision import build_conditioning_pixel_video
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
     "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
@@ -161,8 +165,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 self.safety_checker = CosmosSafetyChecker()
                 self.safety_checker.to(device)
 
-        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
-
     @property
     def default_warmup_resolutions(self):
         return [(720, 1280)]
@@ -197,10 +199,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
     def infer(self, req):
+        video = req.params.video
+        if isinstance(video, list):
+            video = video[0] if video else None
+
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
             image=req.params.image,
+            video=video,
             height=req.params.height,
             width=req.params.width,
             num_frames=req.params.num_frames,
@@ -240,21 +247,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             prompt = prompt.rstrip(".") + ". " + res_text
 
         return prompt
-
-    def _resize_and_center_crop_image(
-        self, image: PIL.Image.Image, height: int, width: int
-    ) -> PIL.Image.Image:
-        """Match Cosmos3 reference preprocessing for conditioning images."""
-        orig_w, orig_h = image.size
-        scaling_ratio = max(width / orig_w, height / orig_h)
-        resize_w = int(math.ceil(scaling_ratio * orig_w))
-        resize_h = int(math.ceil(scaling_ratio * orig_h))
-
-        image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
-
-        left = max((resize_w - width) // 2, 0)
-        top = max((resize_h - height) // 2, 0)
-        return image.crop((left, top, left + width, top + height))
 
     @nvtx_range("_tokenize_prompt", color="blue")
     def _tokenize_prompt(
@@ -314,43 +306,20 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
-    # -- I2V latent preparation -----------------------------------------------
+    # -- I2V / V2V latent preparation -----------------------------------------
 
-    def _encode_conditioning_video(
-        self,
-        image_tensor: torch.Tensor,
-        num_frames: int,
-        height: int,
-        width: int,
-    ) -> torch.Tensor:
-        """VAE-encode a conditioning image as a full-length video.
-
-        The WAN VAE has temporal compression (factor 4), so encoding a single
-        frame produces degenerate temporal features.  Following imaginaire4's
-        ``build_conditioned_video_batch``, we fill the entire pixel-space video
-        with the conditioning image (repeating it across all frames) so the
-        temporal encoder sees plausible content everywhere.  The caller then
-        keeps only the conditioned latent frame(s) and replaces the rest with
-        noise.
+    def _encode_pixel_video(self, pixel_video: torch.Tensor) -> torch.Tensor:
+        """VAE-encode a pixel-space video batch.
 
         Args:
-            image_tensor: [1, 3, H, W] in [-1, 1]
-            num_frames: total pixel frames for the video
-            height: pixel height
-            width: pixel width
+            pixel_video: ``[1, 3, T, H, W]`` in ``[-1, 1]``.
 
         Returns:
-            [1, C, T_latent, H_latent, W_latent] normalized latent of the
-            full conditioning video.
+            ``[1, C, T_latent, H_latent, W_latent]`` normalized latent.
         """
-        # Build pixel-space video: repeat the conditioning image across all frames
-        # image_tensor: [1, 3, H, W] -> [1, 3, 1, H, W] -> [1, 3, num_frames, H, W]
-        video = image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
-        video = video.to(device=self.device, dtype=self.vae.dtype)
-
+        video = pixel_video.to(device=self.device, dtype=self.vae.dtype)
         latent = self.vae.encode(video).latent_dist.mode()
 
-        # Normalize (inverse of _decode_latents denormalization)
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
@@ -369,31 +338,26 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         return latent.to(self.dtype)
 
-    def _prepare_latents_i2v(
+    def _prepare_latents_conditioned(
         self,
-        image_tensor: torch.Tensor,
+        pixel_video: torch.Tensor,
+        condition_frame_indexes: list[int],
         height: int,
         width: int,
         num_frames: int,
         generator: torch.Generator,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare initial latents with frame 0 conditioned on the input image.
-
-        The conditioning image is repeated across all pixel frames before VAE
-        encoding so the temporal encoder sees plausible content everywhere
-        (avoids degenerate single-frame encoding with the WAN VAE's temporal
-        compression).  Only frame 0 of the resulting latent is kept clean;
-        the rest is replaced with noise.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare latents with selected latent frames kept as clean conditioning.
 
         Returns:
-            latents: [1, C, T_lat, H_lat, W_lat] with frame 0 = image, rest = noise
-            velocity_mask: [1, 1, T_lat, 1, 1] with frame 0 = 0, rest = 1
-            image_latent: [1, C, 1, H_lat, W_lat] clean frame 0 for re-injection
+            latents: initial noisy/clean mixture
+            velocity_mask: ``1`` on frames to denoise, ``0`` on conditioned frames
+            cond_latent: full VAE-encoded latent used for decode re-injection
+            condition_mask: ``1`` on conditioned latent frames
         """
         C = self.transformer.latent_channel_size
         T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
-        # Pure noise
         noise = randn_tensor(
             (
                 1,
@@ -407,24 +371,22 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             dtype=self.dtype,
         )
 
-        # Encode full conditioning video (image repeated across all frames)
-        cond_latent = self._encode_conditioning_video(
-            image_tensor,
-            num_frames,
-            height,
-            width,
-        )  # [1, C, T_lat, H_lat, W_lat]
-
-        # Keep only frame 0 for conditioning; replace rest with noise
-        image_latent = cond_latent[:, :, 0:1, :, :]  # [1, C, 1, H_lat, W_lat]
+        cond_latent = self._encode_pixel_video(pixel_video)
 
         condition_mask = torch.zeros(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
-        condition_mask[:, :, 0, :, :] = 1.0
+        for idx in condition_frame_indexes:
+            if 0 <= idx < T_lat:
+                condition_mask[:, :, idx, :, :] = 1.0
+
+        if condition_mask.sum() == 0:
+            raise ValueError(
+                f"No valid conditioning latent frames in {condition_frame_indexes} "
+                f"for T_lat={T_lat}."
+            )
 
         latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
-
         velocity_mask = 1.0 - condition_mask
-        return latents, velocity_mask, image_latent
+        return latents, velocity_mask, cond_latent, condition_mask
 
     # =========================================================================
     # VAE decode
@@ -481,6 +443,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        video: Optional[Union[str, bytes]] = None,
         height: int = COSMOS3_720P_PARAMS["height"],
         width: int = COSMOS3_720P_PARAMS["width"],
         num_frames: int = COSMOS3_720P_PARAMS["num_frames"],
@@ -509,14 +472,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # TODO: support batch generation
             raise ValueError("Batch generation is not supported for Cosmos3")
 
-        # Validate image input — only single image is supported for batch generation
+        if image is not None and video is not None:
+            raise ValueError("Only one of `image` or `video` may be provided for conditioning.")
+
         if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
             raise ValueError(
                 f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
-                f"got {type(image)}. Batch of different images is not supported; "
-                f"use a single image with multiple prompts instead."
+                f"got {type(image)}."
             )
 
+        if video is not None and not isinstance(video, (str, bytes)):
+            raise ValueError(f"`video` must be a file path string or raw bytes, got {type(video)}.")
+
+        has_conditioning = image is not None or video is not None
         # Text guardrail — check both positive and user-supplied negative prompts.
         # None negative_prompt means the hardcoded default will be used (safe); skip it.
         text_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
@@ -577,26 +545,39 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
 
         # 2. Prepare latents
-        if image is not None:
-            if isinstance(image, str):
-                image = PIL.Image.open(image).convert("RGB")
-
-            if isinstance(image, PIL.Image.Image):
-                image = image.convert("RGB")
-                image = self._resize_and_center_crop_image(image, height=height, width=width)
-                image = self.video_processor.preprocess(
-                    image,
+        condition_mask = None
+        cond_latent = None
+        tmp_video_path = None
+        if has_conditioning:
+            condition_frame_indexes = cosmos3_condition_frame_indexes_for_input(
+                has_video_input=video is not None
+            )
+            try:
+                pixel_video, tmp_video_path = build_conditioning_pixel_video(
+                    image=image,
+                    video=video,
                     height=height,
                     width=width,
+                    num_frames=num_frames,
+                    condition_frame_indexes=condition_frame_indexes,
+                    temporal_compression=self.vae_scale_factor_temporal,
                 )
-
-            latents, velocity_mask, image_latent = self._prepare_latents_i2v(
-                image, height=height, width=width, num_frames=num_frames, generator=generator
-            )
+                latents, velocity_mask, cond_latent, condition_mask = (
+                    self._prepare_latents_conditioned(
+                        pixel_video,
+                        condition_frame_indexes=condition_frame_indexes,
+                        height=height,
+                        width=width,
+                        num_frames=num_frames,
+                        generator=generator,
+                    )
+                )
+            finally:
+                if tmp_video_path is not None and os.path.exists(tmp_video_path):
+                    os.unlink(tmp_video_path)
         else:
             latents = self._prepare_latents(height, width, num_frames, generator)
             velocity_mask = None
-            image_latent = None
 
         # Compute video shape in latent space
         T_latent = latents.shape[2]
@@ -697,9 +678,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         logger.info("Decoding video...")
         decode_start = time.time()
 
-        if image_latent is not None:
+        if condition_mask is not None:
             latents = latents.clone()
-            latents[:, :, 0:1, :, :] = image_latent.to(device=latents.device, dtype=latents.dtype)
+            latents = torch.where(
+                condition_mask.bool(),
+                cond_latent.to(device=latents.device, dtype=latents.dtype),
+                latents,
+            )
 
         video = self.decode_latents(latents, self._decode_latents)
 

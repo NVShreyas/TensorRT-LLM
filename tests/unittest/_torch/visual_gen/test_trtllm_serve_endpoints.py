@@ -706,6 +706,28 @@ class TestVideoGenerationSync:
         assert params.image.endswith("_reference.png")
         assert os.path.exists(params.image)
 
+    def test_sync_video_generation_multipart_with_video_reference(self, video_client, tmp_path):
+        mp4_bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00" + b"\x00" * 32
+
+        resp = video_client.post(
+            "/v1/videos/generations",
+            data={
+                "prompt": "Continue this clip",
+                "size": "64x64",
+                "seconds": "1.0",
+                "fps": "8",
+            },
+            files={"input_reference": ("ref.mp4", BytesIO(mp4_bytes), "video/mp4")},
+        )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
+        params = video_client.mock_gen.last_params
+        assert isinstance(params.video, str)
+        assert params.video.endswith("_reference.mp4")
+        assert params.image is None
+        assert os.path.exists(params.video)
+
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
             "/v1/videos/generations",
