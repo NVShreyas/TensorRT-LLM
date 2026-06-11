@@ -66,6 +66,7 @@ _TYPE_MAP = {
     "bool": (bool,),
     "str": (str,),
     "list": (list,),
+    "path_or_list": (list, str),
 }
 
 # Generation config fields that pipelines declare defaults for.
