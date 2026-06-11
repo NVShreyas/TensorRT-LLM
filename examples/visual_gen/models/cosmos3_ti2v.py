@@ -13,11 +13,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-r"""Cosmos3 Text(+Image)-to-Video generation.
+r"""Cosmos3 Text(+Image)-to-Video and action generation.
 
-Cosmos3 OmniMoT supports text-only (T2V) and image-conditioned (I2V/TI2V)
-generation from the same checkpoint. Pass ``--image_path`` to condition on a
-reference frame.
+Cosmos3 OmniMoT supports text-only (T2V), image-conditioned (I2V/TI2V), optional
+audio, and action generation (policy / forward dynamics / inverse dynamics) from
+the same checkpoint when ``action_gen`` is enabled.
 
 Checkpoints (pass the Hub ID or local path via ``--model``):
 
@@ -45,30 +45,12 @@ Deployment configs (``examples/visual_gen/configs/``):
 - ``cosmos3-super-4gpu.yaml`` — 4 GPU, CFG + Ulysses + parallel VAE
 
 Usage:
+    # T2V
     python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
-        --prompt "The video opens with a view of a well-lit indoor space featuring a " \\
-        "wooden display case with compartments filled with various fruits, " \\
-        "including bananas, apples, pears, oranges, and carambolas. " \\
-        "The bananas are neatly arranged in the middle compartment, while apples " \\
-        "are in the left and a mix of pears, oranges, and carambolas are in the " \\
-        "right. " \\
-        "Two robotic arms with grippers are positioned at the bottom of the frame, " \\
-        "with the one on the left remaining stationary, partially obscuring the " \\
-        "apples. " \\
-        "The robotic arm on the right begins its action, extending towards the " \\
-        "right side of the display case. " \\
-        "It carefully picks up a pear from the fruit section, placing it into a " \\
-        "plastic bag in the shopping cart nearby, which has red handles. " \\
-        "After securing the pear, the arm retracts back to its original position. " \\
-        "The process repeats as the robotic arm picks up an orange and places it " \\
-        "in the bag, followed by a carambola. " \\
-        "The final frame captures the robotic arm returning to its initial " \\
-        "position, leaving the display case and surrounding area unchanged. " \\
-        "The video showcases a seamless and efficient automated fruit-picking " \\
-        "process, highlighting the precision and efficiency of modern robotics " \\
-        "in a retail setting." \
+        --prompt "A serene mountain lake at sunrise." \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
+    # T2V + audio
     python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
         --prompt "A low-angle tracking shot follows a man riding a vintage black motorcycle " \\
         "across a lush green grassy yard. Sunlight filters through overhead trees, casting " \\
@@ -89,6 +71,39 @@ Usage:
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
         --enable_audio
 
+    # Action — policy (first frame + instruction -> predicted action + rollout video)
+    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+        --prompt "Pick up the pear and place it in the bag." \
+        --image_path first_frame.png \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+        --action_mode policy \
+        --domain_name bridge_orig_lerobot \
+        --raw_action_dim 10 \
+        --output_path policy_rollout.mp4 \
+        --action_output_path policy_action.json
+
+    # Action — forward dynamics (first frame + action trajectory -> rollout video)
+    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+        --prompt "Robot manipulation rollout." \
+        --image_path first_frame.png \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+        --action_mode forward_dynamics \
+        --domain_name av \
+        --action_json action_trajectory.json \
+        --output_path forward_dynamics.mp4
+
+    # Action — inverse dynamics (video -> predicted action)
+    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
+        --prompt "Recover the robot action from this clip." \
+        --video_path /path/to/frames/ \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+        --action_mode inverse_dynamics \
+        --domain_name bridge_orig_lerobot \
+        --raw_action_dim 10 \
+        --output_path inverse_video.mp4 \
+        --action_output_path inverse_action.json
+
+    # Text-to-image
     python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \
         --prompt "A cute puppy playing with a ball in a park" \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
@@ -96,11 +111,103 @@ Usage:
         --output_path output.png
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
+from pathlib import Path
+from typing import Any, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_ACTION_PARAMS
+
+ACTION_MODES = frozenset({"policy", "forward_dynamics", "inverse_dynamics"})
+
+
+def _validate_action_args(args: argparse.Namespace) -> None:
+    if args.action_mode is None:
+        return
+
+    mode = args.action_mode.strip().lower()
+    if mode not in ACTION_MODES:
+        raise SystemExit(
+            f"Invalid --action_mode {args.action_mode!r}; expected one of {sorted(ACTION_MODES)}."
+        )
+    if args.enable_audio:
+        raise SystemExit("Cosmos3 does not support joint action and audio generation.")
+    if args.output_type != "video":
+        raise SystemExit("Action generation requires --output_type video.")
+
+    if mode == "forward_dynamics":
+        if args.action_json is None:
+            raise SystemExit(f"{mode} requires --action_json.")
+        if args.image_path is None and args.video_path is None:
+            raise SystemExit(f"{mode} requires --image_path or --video_path for the first frame.")
+    elif mode == "policy":
+        if args.image_path is None and args.video_path is None:
+            raise SystemExit(f"{mode} requires --image_path or --video_path for the first frame.")
+        if args.raw_action_dim is None:
+            raise SystemExit(f"{mode} requires --raw_action_dim.")
+    elif mode == "inverse_dynamics":
+        if args.video_path is None:
+            raise SystemExit(f"{mode} requires --video_path (frame directory or image list).")
+        if args.raw_action_dim is None:
+            raise SystemExit(f"{mode} requires --raw_action_dim.")
+
+
+def _apply_action_generation_params(params, args: argparse.Namespace) -> None:
+    """Set 480p action defaults on the request before pipeline overrides."""
+    chunk = args.action_chunk_size or COSMOS3_ACTION_PARAMS["action_chunk_size"]
+    params.height = 480
+    params.width = 832
+    params.num_frames = chunk + 1
+    params.num_inference_steps = COSMOS3_ACTION_PARAMS["num_inference_steps"]
+    params.guidance_scale = COSMOS3_ACTION_PARAMS["guidance_scale"]
+    params.frame_rate = COSMOS3_ACTION_PARAMS["frame_rate"]
+    params.extra_params["action_chunk_size"] = chunk
+
+
+def _default_action_output_path(video_path: str) -> str:
+    stem = Path(video_path)
+    if stem.suffix:
+        return str(stem.with_name(f"{stem.stem}_action.json"))
+    return f"{video_path}_action.json"
+
+
+def _save_action_output(output, path: str) -> None:
+    if output.action is None:
+        return
+
+    action = output.action
+    if action.ndim == 3 and action.shape[0] == 1:
+        action_data = action[0].tolist()
+        shape = list(action.shape[1:])
+    else:
+        action_data = action.tolist()
+        shape = list(action.shape)
+
+    payload = {
+        "action_mode": output.action_mode,
+        "domain_id": output.domain_id,
+        "raw_action_dim": output.raw_action_dim,
+        "shape": shape,
+        "dtype": str(action.dtype).replace("torch.", ""),
+        "data": action_data,
+    }
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _load_negative_prompt(path: Optional[str]) -> Any:
+    if path is None:
+        return None
+    if os.path.isfile(path) and path.endswith(".json"):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return path
 
 
 def main():
@@ -135,13 +242,13 @@ def main():
         "--image_path",
         type=str,
         default=None,
-        help="Optional conditioning image path for I2V/TI2V",
+        help="Conditioning image for I2V/TI2V or action policy/forward_dynamics",
     )
     parser.add_argument(
         "--output_path",
         type=str,
         default="cosmos3_ti2v_output.mp4",
-        help="Path to save the output video",
+        help="Path to save the output video or image",
     )
     parser.add_argument(
         "--enable_duration_template", action="store_true", help="Enable duration template in prompt"
@@ -156,7 +263,63 @@ def main():
     )
     parser.add_argument("--enable_audio", action="store_true", help="Enable audio generation")
     parser.add_argument(
-        "--output_type", type=str, default="video", help="Output type (video, image)"
+        "--action_mode",
+        type=str,
+        default=None,
+        choices=sorted(ACTION_MODES),
+        help="Action mode: policy, forward_dynamics, or inverse_dynamics",
+    )
+    parser.add_argument(
+        "--domain_name",
+        type=str,
+        default=None,
+        help="Embodiment domain name (e.g. bridge_orig_lerobot, av, droid_lerobot)",
+    )
+    parser.add_argument(
+        "--domain_id",
+        type=int,
+        default=None,
+        help="Embodiment domain id (alternative to --domain_name)",
+    )
+    parser.add_argument(
+        "--raw_action_dim",
+        type=int,
+        default=None,
+        help="Raw action DOF for policy/inverse_dynamics",
+    )
+    parser.add_argument(
+        "--action_chunk_size",
+        type=int,
+        default=None,
+        help=f"Action tokens to generate (default {COSMOS3_ACTION_PARAMS['action_chunk_size']})",
+    )
+    parser.add_argument(
+        "--action_json",
+        type=str,
+        default=None,
+        help="JSON file with action trajectory [T, D] for forward_dynamics",
+    )
+    parser.add_argument(
+        "--video_path",
+        type=str,
+        default=None,
+        help="Frame directory or image path for inverse_dynamics (or first-frame fallback)",
+    )
+    parser.add_argument(
+        "--action_resolution",
+        type=int,
+        default=480,
+        choices=[256, 480, 704, 720],
+        help="Resolution bucket for action image sizing",
+    )
+    parser.add_argument(
+        "--action_output_path",
+        type=str,
+        default=None,
+        help="Path to save predicted action JSON (default: <output_stem>_action.json)",
+    )
+    parser.add_argument(
+        "--output_type", type=str, default="video", choices=["video", "image"], help="Output type"
     )
 
     # Guardrails
@@ -164,24 +327,20 @@ def main():
         "--disable_guardrails", action="store_true", help="NOT RECOMMENDED: Disable guardrails"
     )
     args = parser.parse_args()
+    _validate_action_args(args)
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
-    # --- Model-specific: T2V / TI2V request construction ---
-    # Query per-model defaults (resolution, steps, guidance, seed, etc.).
     params = visual_gen.default_params
     if args.image_path is not None:
         params.image = args.image_path
 
-    if args.negative_prompt is not None:
-        if os.path.isfile(args.negative_prompt) and args.negative_prompt.endswith(".json"):
-            negative_prompt = json.load(open(args.negative_prompt))
-        else:
-            negative_prompt = args.negative_prompt
-    else:
-        negative_prompt = None
+    if args.action_mode is not None:
+        _apply_action_generation_params(params, args)
+
+    negative_prompt = _load_negative_prompt(args.negative_prompt)
 
     params.extra_params["use_duration_template"] = args.enable_duration_template
     params.extra_params["use_resolution_template"] = args.enable_resolution_template
@@ -189,6 +348,23 @@ def main():
     params.extra_params["enable_audio"] = args.enable_audio
     params.extra_params["use_guardrails"] = not args.disable_guardrails
     params.extra_params["output_type"] = args.output_type
+    params.extra_params["action_resolution"] = args.action_resolution
+
+    if args.action_mode is not None:
+        params.extra_params["action_mode"] = args.action_mode
+    if args.domain_name is not None:
+        params.extra_params["domain_name"] = args.domain_name
+    if args.domain_id is not None:
+        params.extra_params["domain_id"] = args.domain_id
+    if args.raw_action_dim is not None:
+        params.extra_params["raw_action_dim"] = args.raw_action_dim
+    if args.action_chunk_size is not None:
+        params.extra_params["action_chunk_size"] = args.action_chunk_size
+    if args.action_json is not None:
+        with open(args.action_json, encoding="utf-8") as f:
+            params.extra_params["action"] = json.load(f)
+    if args.video_path is not None:
+        params.extra_params["video"] = args.video_path
 
     if negative_prompt is None:
         params.negative_prompt = None
@@ -202,8 +378,24 @@ def main():
         params=params,
     )
 
+    if output.error is not None:
+        raise SystemExit(f"Generation failed: {output.error}")
+
     output.save(args.output_path)
     print(f"Saved: {args.output_path}")
+
+    if args.action_mode is not None:
+        action_path = args.action_output_path or _default_action_output_path(args.output_path)
+        _save_action_output(output, action_path)
+        if output.action is not None:
+            print(f"Saved action: {action_path}")
+            print(
+                f"Action shape: {tuple(output.action.shape)}, "
+                f"raw_action_dim={output.raw_action_dim}, domain_id={output.domain_id}"
+            )
+        else:
+            print("Warning: action_mode was set but the output carried no action tensor.")
+
     print(output.metrics)
 
 
